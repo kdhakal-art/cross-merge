@@ -1,0 +1,226 @@
+#!/bin/bash
+#This script Merges production branches into Feture branches
+
+if [ $# -ne 3 ]
+then
+	echo "Please provide Sprint number, BITBUCKET_USER and BITBUCKET_API_KEY as input"
+	echo "usage: $0 <SPRINT_NUM> <BITBUCKET_USER> <BITBUCKET_API_KEY> "
+	echo "Example: $0 50 xyz@deloitte.com NTg0NDcabcdODEwOsh7H4aI55o9xMSnFfhEeqC"
+	exit 1
+fi
+
+SPRINT_NUM=$1
+BITBUCKET_USER=$2
+BITBUCKET_API_KEY=$3
+
+DATE=$(date +%Y%m%d)
+DATE_TIME=$(date +%Y%m%d%H%M%S)
+CONFIG_FILE="feature_branches.conf"
+SOURCE_BRANCH="Production"
+#REPOS should list both aspen and aspen+ repos
+REPOS=("aspen" "database" "internal-portal-modules" "aspen-integration-modules" "internal-portal-ui-lift" "gen-ai-services" "ai-services")
+#below variable only lists aspen+ repos
+ASPEN_PLUS_REPOS=("internal-portal-modules" "aspen-integration-modules" "internal-portal-ui-lift" "gen-ai-services" "ai-services")
+LOG_FILE="merge_prod_to_features_${DATE_TIME}.log"
+SUCCESS_BRANCH_LOG="Successfully_merged_branchs_${DATE_TIME}.log"
+FAILURE_BRANCH_LOG="Failed_to_merge_branchs_${DATE_TIME}.log"
+PRS_LOG="PRs_created_for_conflict_resolution_${DATE_TIME}.log"
+PROJECT_KEY='ASPEN'
+
+BB_BASE_URL='https://hhsbb.hsd.state.nm.us'
+
+
+#check if GITLFS is installed
+export GIT_LFS_SKIP_SMUDGE=1
+git lfs install --local 2>/dev/null || true
+
+declare -A FEATURE_BRANCHES
+declare -A REVIEWERS
+current_repo=""
+while IFS= read -r line; do
+	echo "Processing Line $line"
+
+     # Trim leading/trailing whitespace
+    line=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+
+    [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
+	
+	if [[ "$line" =~ ^\[(.*)\]$ ]]; then
+		echo "confing for new repo found $line"
+        current_repo="${BASH_REMATCH[1]}"
+		echo "current repo set to : $current_repo"
+        FEATURE_BRANCHES[$current_repo]=""
+        REVIEWERS[$current_repo]=""
+    else
+		if [[ "$line" =~ ^([^:]+)[[:space:]]*:[[:space:]]*(.+)$ ]]; then
+            branch_name="${BASH_REMATCH[1]}"
+            branch_name=$(echo "$branch_name" | xargs)
+            reviewer_list="${BASH_REMATCH[2]}"
+            reviewer_list=$(echo "$reviewer_list" | xargs)
+
+            echo "  Branch: '$branch_name'"
+            echo "  Reviewers: '$reviewer_list'"
+
+            FEATURE_BRANCHES[$current_repo]+="$branch_name "
+		    REVIEWERS[$current_repo]+="$branch_name:$reviewer_list|"
+        fi
+    fi
+
+done < "$CONFIG_FILE"
+
+# Function to get reviewers for a specific repo and branch
+get_reviewers() {
+    local repo=$1
+    local branch=$2
+    local reviewer_data="${REVIEWERS[$repo]}"
+    
+    # Parse the reviewer data for this branch
+    while IFS='|' read -ra ENTRIES; do
+        for entry in "${ENTRIES[@]}"; do
+            if [[ "$entry" =~ ^([^:]+):(.+)$ ]]; then
+                entry_branch="${BASH_REMATCH[1]}"
+                entry_branch=$(echo "$entry_branch" | xargs)
+                entry_reviewers="${BASH_REMATCH[2]}"
+                
+                if [[ "$entry_branch" == "$branch" ]]; then
+                    echo "$entry_reviewers"
+                    return
+                fi
+            fi
+        done
+    done <<< "$reviewer_data"
+}
+
+# Function to build JSON reviewers array for Bitbucket API
+build_reviewers_json() {
+    local reviewers=$1
+    local json_array="["
+    local first=true
+    
+    IFS=',' read -ra EMAILS <<< "$reviewers"
+    for email in "${EMAILS[@]}"; do
+        email=$(echo "$email" | xargs)  # trim whitespace
+        if [[ "$first" == true ]]; then
+            first=false
+        else
+            json_array+=","
+        fi
+        json_array+="{\"user\":{\"name\":\"$email\"}}"
+    done
+    json_array+="]"
+    echo "$json_array"
+}
+
+
+echo "=== Merge Script Started at $(date) ===" >> "$LOG_FILE"
+echo "moving to parent directory of the script" | tee -a "$LOG_FILE"
+cd "../.."
+for repo in "${REPOS[@]}"; do
+    echo "Processing repo: $repo" | tee -a "$LOG_FILE"
+    cd "$repo" || { echo "Repo $repo not found!" | tee -a "../$LOG_FILE"; exit 1; }
+    echo "---------------------$repo-----------------------" | tee -a "../$SUCCESS_BRANCH_LOG"
+    echo "---------------------$repo-----------------------" | tee -a "../$FAILURE_BRANCH_LOG"
+    echo "---------------------$repo-----------------------" | tee -a "../$PRS_LOG"
+	git fetch
+    SOURCE_BRANCH="Production"
+    PROJECT_KEY='ASPEN'
+    #if repo is in ASPEN_PLUS_REPOS, then set SOURCE_BRANCH to Prod and the project key to AS-P
+    for element in "${ASPEN_PLUS_REPOS[@]}"
+    do
+        if [[ "$element" == "$repo" ]] 
+        then
+            SOURCE_BRANCH="Prod"
+            PROJECT_KEY='AS-P'
+            break # Exit the loop early to save time
+        fi
+    done
+
+	echo "Using source branch: $SOURCE_BRANCH and PROJECT_KEY: $PROJECT_KEY for repo: $repo" | tee -a "../$LOG_FILE"
+
+    for feature in ${FEATURE_BRANCHES[$repo]}; do
+        echo " Processing feature branch: $feature" | tee -a "../$LOG_FILE"
+		echo " Checking out: $feature" | tee -a "../$LOG_FILE"		
+        git checkout $feature 2>&1 | tee -a "../$LOG_FILE"
+		echo " Checking out: $feature Completed" | tee -a "../$LOG_FILE"
+		git pull
+		echo " Pulling Branch: $feature Completed" | tee -a "../$LOG_FILE"
+        MERGE_BRANCH="Sprint${SPRINT_NUM}-Prod-Crossmerge-to-${feature}-${DATE}"
+		echo " Creating Merge branch: $MERGE_BRANCH" | tee -a "../$LOG_FILE"
+        git branch -D $MERGE_BRANCH 2>/dev/null
+        git checkout -b $MERGE_BRANCH 2>&1 | tee -a "../$LOG_FILE"
+		echo " Attemplting to merge $SOURCE_BRANCH into $MERGE_BRANCH" | tee -a "../$LOG_FILE"
+        # Attempt to merge production into the merge branch
+		git merge --no-ff "origin/$SOURCE_BRANCH" 2>&1 | tee -a "../$LOG_FILE"
+		merge_rc=${PIPESTATUS[0]}   # exit code of git merge (first pipeline command)
+        
+		if [[ $merge_rc == 0 ]]; then
+            git commit -m "Merged $SOURCE_BRANCH into $feature" 2>&1 | tee -a "../$LOG_FILE"
+            echo " Merge from $SOURCE_BRANCH into $MERGE_BRANCH successful, proceeding to merge back into $feature" | tee -a "../$LOG_FILE"
+			echo "Checking out $feature" | tee -a "../$LOG_FILE"
+            git checkout $feature 2>&1 | tee -a "../$LOG_FILE"
+            git merge --no-ff $MERGE_BRANCH 2>&1 | tee -a "../$LOG_FILE"
+            git push origin $feature 2>&1 | tee -a "../$LOG_FILE"
+            echo "$feature updated and pushed with production changes." | tee -a "../$LOG_FILE"
+            git branch -D $MERGE_BRANCH 2>&1 | tee -a "../$LOG_FILE"
+            echo "$MERGE_BRANCH" | tee -a "../$SUCCESS_BRANCH_LOG"
+        else
+            echo "$MERGE_BRANCH" | tee -a "../$FAILURE_BRANCH_LOG"
+            echo " Merge conflict detected in $MERGE_BRANCH." | tee -a "../$LOG_FILE"
+			echo " Reverting previous merge" | tee -a "../$LOG_FILE"
+            git merge --abort 2>&1 | tee -a "../$LOG_FILE"
+			echo "Pushing branch to remote for PR" | tee -a "../$LOG_FILE"
+            git push -u origin $MERGE_BRANCH 2>&1 | tee -a "../$LOG_FILE"
+
+			
+			# Get reviewers for this branch
+    		reviewer_emails=$(get_reviewers "$repo" "$feature")
+    		reviewers_json=$(build_reviewers_json "$reviewer_emails")
+
+			echo " Adding reviewers: $reviewer_emails" | tee -a "../$LOG_FILE"
+#extract the PR URL from the response of the curl command and store it in a variable
+pr_response=$(curl -sS --fail-with-body \
+				-H "Authorization: Bearer $BITBUCKET_API_KEY" \
+				-H "Content-Type: application/json" \
+				-X POST \
+				--data-binary @- \
+				"$BB_BASE_URL/rest/api/latest/projects/${PROJECT_KEY}/repos/${repo}/pull-requests" <<EOF 
+				{
+				"title": "Merge $SOURCE_BRANCH into $MERGE_BRANCH (conflict resolution needed)",
+				"description": "Please resolve conflicts between $SOURCE_BRANCH and $MERGE_BRANCH for $feature in ${repo}.",
+				"state": "OPEN",
+				"open": true,
+				"closed": false,
+				"fromRef": {
+					"id": "refs/heads/$SOURCE_BRANCH",
+					"repository": {
+					"slug": "${repo}",
+					"project": { "key": "$PROJECT_KEY" }
+					}
+				},
+				"toRef": {
+					"id": "refs/heads/$MERGE_BRANCH",
+					"repository": {
+					"slug": "${repo}",
+					"project": { "key": "$PROJECT_KEY" }
+					}
+				}
+				,"reviewers": $reviewers_json
+			}
+EOF
+)
+
+				if [[ $? == 0 ]] 
+				then
+                    pr_url=$(echo "$pr_response" | jq -r '.links.self[0].href')
+					echo " PR created from $SOURCE_BRANCH to $MERGE_BRANCH for manual conflict resolution." | tee -a "../$LOG_FILE"
+                    echo "$pr_url" | tee -a "../$PRS_LOG"
+				else
+					echo "PR Creation Failed"
+				fi
+        fi
+    done
+
+    cd ..
+done
+
+echo "=== Merge Script Finished at $(date) ===" >> "$LOG_FILE"
